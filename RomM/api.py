@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from filesystem import MUOS_SUPPORTED_PLATFORMS, Filesystem
 from models import Collection, Platform, Rom
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from status import Status, View
 
 # Load .env file from one folder above
@@ -429,7 +429,76 @@ class API:
         self._status.download_rom_ready.set()
         self._status.abort_download.set()
     
-    def get_rom_assets(self, rom) -> tuple[str, str]:
+
+    def add_rounded_corners(self, im, radius):
+        rounded_mask = Image.new('L', im.size, 0)
+        draw = ImageDraw.Draw(rounded_mask)
+        draw.rounded_rectangle((0, 0, im.size[0], im.size[1]), radius=radius, fill=255)
+        im.putalpha(rounded_mask)
+        return im
+
+    def generate_fade_mask(self, width: int, height: int) -> Image.Image:
+        fade_mask = Image.new('L', (width, height), 0)
+        draw = ImageDraw.Draw(fade_mask)
+        x_crit = width / 3.0
+
+        for x in range(width):
+            if x < x_crit:
+                t = x / x_crit
+                # Usa un'equazione quadratica per far aumentare lentamente l'opacità
+                alpha = int((t ** 2) * (255 / 3))  # a x = x_crit, alpha = 255/3 ≈ 85
+            else:
+                t = (x - x_crit) / (width - x_crit)
+                # Fade lineare da 85 fino a 255
+                alpha = int(85 + t * (255 - 85))
+            draw.line([(x, 0), (x, height)], fill=alpha)
+
+        return fade_mask
+
+    def lazy_get_fade_mask(self, width: int, height: int) -> Image.Image:
+        if not hasattr(self, '_fade_mask') or self._fade_mask.size != (width, height):
+            self._fade_mask = self.generate_fade_mask(width, height)
+        return self._fade_mask
+
+    def process_assets(self, cover_url: str, screenshot_url: str, dest_path: str) -> None:
+        print(f"process_assets -> {cover_url} - {screenshot_url} - {dest_path}")
+        if not cover_url and not screenshot_url:
+            return
+
+        #TODO: custom size based on device
+        final_width, final_height = 640, 480
+
+        background = self.load_image_from_url(screenshot_url) if screenshot_url else Image.new('RGBA', (final_width, final_height), (0, 0, 0, 0))
+        foreground = self.load_image_from_url(cover_url) if cover_url else None
+
+        background = background.resize((final_width, final_height))
+
+        fade = self.lazy_get_fade_mask(final_width, final_height)
+        
+        background.putalpha(fade)
+
+        if foreground:
+            # Definisci le dimensioni massime per la cover
+            max_cover_width = 215
+            max_cover_height = int(final_height * 3 / 5)
+            # Calcola i fattori di scala per larghezza e altezza
+            scale_w = max_cover_width / foreground.width
+            scale_h = max_cover_height / foreground.height
+            # Scegli il fattore di scala minore per rispettare entrambe le limitazioni
+            scale = min(scale_w, scale_h)
+            new_cover_width = int(foreground.width * scale)
+            new_cover_height = int(foreground.height * scale)
+            foreground = foreground.resize((new_cover_width, new_cover_height))
+
+            foreground = self.add_rounded_corners(foreground, radius=20)
+
+            fg_x = final_width - new_cover_width - 20
+            fg_y = (final_height - new_cover_height) // 2
+            background.paste(foreground, (fg_x, fg_y), foreground)
+
+        background.save(dest_path)
+
+    def get_rom_assets(self, rom) -> tuple[str, str, str]:
         import json
         from urllib.request import Request, urlopen
 
@@ -439,18 +508,32 @@ class API:
             with urlopen(req) as response:
                 data = json.load(response)
                 cover_url = data.get("path_cover_small")
+                merged_screenshots = data.get("merged_screenshots", [])
+                screenshot_url = merged_screenshots[0] if merged_screenshots else None
                 summary = data.get("summary")
-                return cover_url, summary
+                return cover_url, screenshot_url, summary
         except Exception as e:
             print(f"Error retrieving rom info: {e}")
             return None, None
     
+    def load_image_from_url(self, url: str) -> Image.Image:
+        from io import BytesIO
+        """
+        Scarica un'immagine dalla web usando urllib.request.Request e la apre
+        con Pillow tramite BytesIO.
+        """
+        req = Request(url, headers=self.headers)
+        with urlopen(req) as response:
+            data = response.read()
+        return Image.open(BytesIO(data)).convert('RGBA')
+
     def download_rom_assets(self, rom) -> None:
         import os
         from urllib.parse import quote
         from pathlib import Path
 
-        cover_url, summary = self.get_rom_assets(rom)
+        cover_url, screenshot_url, summary = self.get_rom_assets(rom)
+
         asset_filename = Path(rom.fs_name).stem
 
         if summary:
@@ -459,26 +542,36 @@ class API:
                 "text",
                 self._sanitize_filename(f"{asset_filename}.txt")
             )
+            os.makedirs(os.path.dirname(summary_dest_path), exist_ok=True)
             with open(summary_dest_path, "w", encoding="utf-8") as f:
                 f.write(summary)
         else:
             print("Summary not found")
 
-        if cover_url:
-            cover_dest_path = os.path.join(
+        if cover_url or screenshot_url:
+            image_dest_path = os.path.join(
                 self._file_system.get_sd_catalogue_path(rom.platform_slug),
                 "box",
                 self._sanitize_filename(f"{asset_filename}.png")
             )
-            os.makedirs(os.path.dirname(cover_dest_path), exist_ok=True)
+            os.makedirs(os.path.dirname(image_dest_path), exist_ok=True)
 
-            cover_url = quote(cover_url, safe=":/?&=")
-            cover_url = f"{self.host}{cover_url}"
-            print(f"cover_url---> {cover_url}")
+            if cover_url:
+                cover_url = quote(cover_url, safe=":/?&=")
+                cover_url = f"{self.host}{cover_url}"
 
-            success = self.download_file(cover_url, cover_dest_path)
-            if not success:
-                print("Error downloading cover")
+            if screenshot_url:
+                screenshot_url = quote(screenshot_url, safe=":/?&=")
+                screenshot_url = f"{self.host}{screenshot_url}"
+
+            self.process_assets(cover_url, screenshot_url, image_dest_path)
+
+
+        #     print(f"cover_url---> {cover_url}")
+
+        #     success = self.download_file(cover_url, cover_dest_path)
+        #     if not success:
+        #         print("Error downloading cover")
         else:
             print("Cover not found")
 
@@ -486,6 +579,10 @@ class API:
     def download_rom(self) -> None:
         self._status.download_queue.sort(key=lambda rom: rom.name)
         for i, rom in enumerate(self._status.download_queue):
+            if self._status.abort_download.is_set():
+                self._reset_download_status(True, True)
+                return
+            
             self._status.downloading_rom = rom
             self._status.downloading_rom_position = i + 1
             dest_path = os.path.join(
@@ -497,9 +594,12 @@ class API:
 
             if self._download_assets:
                 self.download_rom_assets(rom)
+
+            is_in_device = os.path.exists(dest_path)
             
-            if not self.download_file(url, dest_path):
-                return
+            if not is_in_device:
+                if not self.download_file(url, dest_path):
+                    continue
 
             if rom.multi:
                 self._status.extracting_rom = True
@@ -560,7 +660,7 @@ class API:
             ) as out_file:
                 self._status.total_downloaded_bytes = 0
                 chunk_size = 1024
-
+                self._status.downloaded_percent = 0
                 while True:
                     if not self._status.abort_download.is_set():
                         chunk = response.read(chunk_size)
